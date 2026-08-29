@@ -1,0 +1,614 @@
+// =============================================================================
+// Durag Executor DLL
+// Target: Vortex.exe v0.2.23 (Bevy 0.15+ / Rust)
+// Strategy: HWBP for Local Player + WSARecv Hook for Network Entities
+// =============================================================================
+
+#define NOMINMAX
+#define _CRT_SECURE_NO_WARNINGS
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <d3d11.h>
+#include <dxgi.h>
+#include <tlhelp32.h>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <cmath>
+#include <vector>
+#include <string>
+#include <mutex>
+#include <atomic>
+#include <memory>
+#include <psapi.h>
+#include <algorithm>
+
+#pragma comment(lib, "d3d11.lib")
+#pragma comment(lib, "dxgi.lib")
+#pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "ws2_32.lib")
+
+#include "MinHook.h"
+
+// =============================================================================
+// VORTEX NETWORK PROTOCOL DEFINITIONS
+// =============================================================================
+
+namespace vx {
+    struct NetEntity {
+        uint64_t id;
+        float x, y, z;
+        float yaw;
+        bool moving;
+        bool grounded;
+        bool dead;
+        uint64_t last_update;
+        char name[32];
+    };
+}
+
+#define MAX_NET_ENTITIES 64
+static vx::NetEntity g_net_entities[MAX_NET_ENTITIES] = { 0 };
+static std::atomic<int> g_net_entity_count{ 0 };
+static std::mutex g_net_mutex;
+static std::atomic<SOCKET> g_game_socket{ INVALID_SOCKET };
+
+static void UpdateNetEntity(uint64_t id, float x, float y, float z, float yaw, bool moving, bool grounded, bool dead, const char* name = nullptr) {
+    std::lock_guard<std::mutex> lk(g_net_mutex);
+    for (int i = 0; i < g_net_entity_count.load(); i++) {
+        if (g_net_entities[i].id == id) {
+            g_net_entities[i].x = x; g_net_entities[i].y = y; g_net_entities[i].z = z;
+            g_net_entities[i].yaw = yaw;
+            g_net_entities[i].moving = moving;
+            g_net_entities[i].grounded = grounded;
+            g_net_entities[i].dead = dead;
+            g_net_entities[i].last_update = GetTickCount64();
+            if (name && strlen(name) > 0) {
+                strncpy_s(g_net_entities[i].name, sizeof(g_net_entities[i].name), name, _TRUNCATE);
+            }
+            return;
+        }
+    }
+    int idx = g_net_entity_count.load();
+    if (idx < MAX_NET_ENTITIES) {
+        g_net_entities[idx].id = id;
+        g_net_entities[idx].x = x; g_net_entities[idx].y = y; g_net_entities[idx].z = z;
+        g_net_entities[idx].yaw = yaw;
+        g_net_entities[idx].moving = moving;
+        g_net_entities[idx].grounded = grounded;
+        g_net_entities[idx].dead = dead;
+        g_net_entities[idx].last_update = GetTickCount64();
+        if (name && strlen(name) > 0) {
+            strncpy_s(g_net_entities[idx].name, sizeof(g_net_entities[idx].name), name, _TRUNCATE);
+        }
+        else {
+            g_net_entities[idx].name[0] = 0;
+        }
+        g_net_entity_count.store(idx + 1);
+    }
+}
+
+// =============================================================================
+// GLOBAL STATE
+// =============================================================================
+
+static HMODULE g_hModule = nullptr;
+static std::atomic<bool> g_initialized{ false };
+static std::atomic<bool> g_ipc_running{ false };
+static std::atomic<bool> g_shutdown{ false };
+static std::atomic<bool> g_movement_thread_running{ true };
+
+static std::atomic<uintptr_t> g_player_base{ 0 };
+static std::atomic<bool> g_player_locked{ false };
+
+static std::atomic<bool> g_fly_enabled{ false };
+static std::atomic<float> g_fly_speed{ 50.0f };
+static std::atomic<bool> g_speed_enabled{ false };
+static std::atomic<float> g_speed_mult{ 2.5f };
+static std::atomic<bool> g_noclip_enabled{ false };
+
+static std::atomic<float> g_target_x{ 0 };
+static std::atomic<float> g_target_y{ 0 };
+static std::atomic<float> g_target_z{ 0 };
+static std::atomic<bool> g_has_target{ false };
+
+static uintptr_t g_write_hook_addr = 0;
+static std::atomic<bool> g_veh_installed{ false };
+
+static std::atomic<bool> g_orbit_enabled{ false };
+static std::atomic<float> g_orbit_speed{ 2.0f };
+static std::atomic<float> g_orbit_radius{ 5.0f };
+static std::atomic<int> g_orbit_target{ -1 };
+static double g_orbit_angle = 0.0;
+
+static void* g_swap_chain_vtable[18] = { 0 };
+static uintptr_t g_present_addr = 0;
+typedef HRESULT(__stdcall* PresentFn)(IDXGISwapChain*, UINT, UINT);
+static PresentFn g_original_present = nullptr;
+
+// =============================================================================
+// SAFE MEMORY HELPERS
+// =============================================================================
+
+static bool safe_read_floats(uintptr_t addr, float* out, int count) {
+    __try { float* src = (float*)addr; for (int i = 0; i < count; ++i) out[i] = src[i]; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+static bool safe_write_float(uintptr_t addr, float val) {
+    __try { *(volatile float*)addr = val; return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// =============================================================================
+// PACKET PROCESSING
+// =============================================================================
+
+static void ProcessInboundPacket(const uint8_t* data, size_t len) {
+    if (len < 1) return;
+    uint8_t opcode = data[0];
+
+    if (opcode == 9 && len >= 40) {
+        uint32_t entityCount = 0;
+        memcpy(&entityCount, data + 4, 4);
+
+        size_t offset = 12;
+
+        for (uint32_t i = 0; i < entityCount && offset + 28 <= len; i++) {
+            uint64_t entityId = 0;
+            memcpy(&entityId, data + offset, 8);
+
+            float x, y, z, yaw;
+            memcpy(&x, data + offset + 8, 4);
+            memcpy(&y, data + offset + 12, 4);
+            memcpy(&z, data + offset + 16, 4);
+            memcpy(&yaw, data + offset + 20, 4);
+
+            uint8_t moving = data[offset + 24];
+            uint8_t grounded = data[offset + 25];
+            uint8_t dead = data[offset + 26];
+
+            if (std::isfinite(x) && std::isfinite(y) && std::isfinite(z) &&
+                std::abs(x) < 100000.0f && std::abs(y) < 100000.0f && std::abs(z) < 100000.0f) {
+                UpdateNetEntity(entityId, x, y, z, yaw, moving != 0, grounded != 0, dead != 0);
+            }
+            offset += 27;
+        }
+    }
+
+    if (opcode == 2 && len >= 20) {
+        uint32_t playerId = 0;
+        memcpy(&playerId, data + 4, 4);
+        uint32_t nameLen = 0;
+        memcpy(&nameLen, data + 12, 4);
+        if (nameLen > 0 && nameLen < 32 && 20 + nameLen <= len) {
+            char name[33] = { 0 };
+            memcpy(name, data + 20, nameLen);
+            name[nameLen] = '\0';
+            char dbg[128];
+            snprintf(dbg, sizeof(dbg), "[Durag] Player: %s (id=%u)", name, playerId);
+            OutputDebugStringA(dbg);
+            // Update the entity's name
+            UpdateNetEntity(playerId, 0, 0, 0, 0, false, false, false, name);
+        }
+    }
+}
+
+// =============================================================================
+// WINSOCK HOOKS
+// =============================================================================
+
+typedef int (WSAAPI* WSARecvFn)(SOCKET, LPWSABUF, DWORD, LPDWORD, LPDWORD, LPWSAOVERLAPPED, LPWSAOVERLAPPED_COMPLETION_ROUTINE);
+static WSARecvFn g_original_WSARecv = nullptr;
+
+typedef int (WSAAPI* RecvFn)(SOCKET, char*, int, int);
+static RecvFn g_original_recv = nullptr;
+
+int WSAAPI Hooked_WSARecv(SOCKET s, LPWSABUF lpBuffers, DWORD dwBufferCount, LPDWORD lpNumberOfBytesRecvd, LPDWORD lpFlags, LPWSAOVERLAPPED lpOverlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine) {
+    if (g_game_socket.load() == INVALID_SOCKET) g_game_socket.store(s);
+    int result = g_original_WSARecv(s, lpBuffers, dwBufferCount, lpNumberOfBytesRecvd, lpFlags, lpOverlapped, lpCompletionRoutine);
+    if (result == 0 && lpNumberOfBytesRecvd && *lpNumberOfBytesRecvd > 0 && lpBuffers && dwBufferCount > 0) {
+        ProcessInboundPacket((const uint8_t*)lpBuffers[0].buf, *lpNumberOfBytesRecvd);
+    }
+    return result;
+}
+
+int WSAAPI Hooked_recv(SOCKET s, char* buf, int len, int flags) {
+    if (g_game_socket.load() == INVALID_SOCKET) g_game_socket.store(s);
+    int result = g_original_recv(s, buf, len, flags);
+    if (result > 0) {
+        ProcessInboundPacket((const uint8_t*)buf, result);
+    }
+    return result;
+}
+
+bool hook_winsock() {
+    HMODULE hWs2_32 = GetModuleHandleA("ws2_32.dll");
+    if (!hWs2_32) hWs2_32 = LoadLibraryA("ws2_32.dll");
+    if (!hWs2_32) return false;
+    bool success = true;
+    FARPROC addr_recv = GetProcAddress(hWs2_32, "recv");
+    if (addr_recv) {
+        if (MH_CreateHook((LPVOID)addr_recv, reinterpret_cast<LPVOID>(&Hooked_recv), reinterpret_cast<LPVOID*>(&g_original_recv)) != MH_OK) success = false;
+        if (MH_EnableHook((LPVOID)addr_recv) != MH_OK) success = false;
+    }
+    FARPROC addr_wsarecv = GetProcAddress(hWs2_32, "WSARecv");
+    if (addr_wsarecv) {
+        if (MH_CreateHook((LPVOID)addr_wsarecv, reinterpret_cast<LPVOID>(&Hooked_WSARecv), reinterpret_cast<LPVOID*>(&g_original_WSARecv)) != MH_OK) success = false;
+        if (MH_EnableHook((LPVOID)addr_wsarecv) != MH_OK) success = false;
+    }
+    if (success) OutputDebugStringA("[Durag] Winsock hooked");
+    return success;
+}
+
+// =============================================================================
+// HARDWARE BREAKPOINT
+// =============================================================================
+
+LONG WINAPI VectoredHandler(PEXCEPTION_POINTERS pExceptionInfo) {
+    if (pExceptionInfo->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
+        if (pExceptionInfo->ContextRecord->Rip == g_write_hook_addr) {
+            uintptr_t rcx = pExceptionInfo->ContextRecord->Rcx;
+            if (rcx) {
+                if (!g_player_locked.exchange(true)) {
+                    g_player_base.store(rcx, std::memory_order_relaxed);
+                    OutputDebugStringA("[Durag] Player base locked!");
+                }
+            }
+            pExceptionInfo->ContextRecord->EFlags |= 0x10000;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void SetHardwareBreakpointOnAllThreads(uintptr_t addr) {
+    g_write_hook_addr = addr;
+    if (!g_veh_installed.exchange(true)) AddVectoredExceptionHandler(1, VectoredHandler);
+    DWORD current_tid = GetCurrentThreadId();
+    DWORD pid = GetCurrentProcessId();
+    __try {
+        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, pid);
+        if (hSnapshot == INVALID_HANDLE_VALUE) return;
+        THREADENTRY32 te32; te32.dwSize = sizeof(THREADENTRY32);
+        if (Thread32First(hSnapshot, &te32)) {
+            do {
+                if (te32.th32OwnerProcessID != pid) continue;
+                if (te32.th32ThreadID == current_tid) continue;
+                HANDLE hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, te32.th32ThreadID);
+                if (!hThread) continue;
+                __try {
+                    CONTEXT ctx = { 0 }; ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                    if (GetThreadContext(hThread, &ctx)) { ctx.Dr0 = addr; ctx.Dr7 = (ctx.Dr7 & ~0xF) | 0x1; SetThreadContext(hThread, &ctx); }
+                }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
+                CloseHandle(hThread);
+            } while (Thread32Next(hSnapshot, &te32));
+        }
+        CloseHandle(hSnapshot);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+void InstallWriteHook() {
+    HMODULE h_exe = GetModuleHandleA(nullptr);
+    if (!h_exe) return;
+    uintptr_t base = (uintptr_t)h_exe;
+    SetHardwareBreakpointOnAllThreads(base + 0x3B41C1);
+}
+
+// =============================================================================
+// MOVEMENT
+// =============================================================================
+
+static bool key_down(int vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+void apply_movement() {
+    uintptr_t base = g_player_base.load(std::memory_order_relaxed);
+    if (!base) return;
+    float pos[3];
+    if (!safe_read_floats(base, pos, 3)) return;
+    if (!std::isfinite(pos[0]) || !std::isfinite(pos[1]) || !std::isfinite(pos[2])) return;
+    float x = pos[0], y = pos[1], z = pos[2];
+    bool fly = g_fly_enabled.load(), noclip = g_noclip_enabled.load(), speed = g_speed_enabled.load(), orbit = g_orbit_enabled.load();
+    bool active = fly || noclip || speed || orbit;
+    if (!active) { g_has_target.store(false); return; }
+    float tx, ty, tz;
+    if (!g_has_target.exchange(true)) { tx = x; ty = y; tz = z; }
+    else { tx = g_target_x.load(); ty = g_target_y.load(); tz = g_target_z.load(); if (!std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(tz)) { tx = x; ty = y; tz = z; } }
+    float dt = 0.001f;
+
+    if (orbit) {
+        float targetX = 0, targetY = 0, targetZ = 0; bool foundTarget = false;
+        {
+            std::lock_guard<std::mutex> lk(g_net_mutex);
+            float nearestDist = 999999.0f; int targetIdx = g_orbit_target.load();
+            if (targetIdx == -1) {
+                for (int i = 0; i < g_net_entity_count.load(); i++) {
+                    if (GetTickCount64() - g_net_entities[i].last_update > 10000 || g_net_entities[i].dead) continue;
+                    float dx = g_net_entities[i].x - x, dy = g_net_entities[i].y - y, dz = g_net_entities[i].z - z;
+                    float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (dist > 1.0f && dist < nearestDist) { nearestDist = dist; targetX = g_net_entities[i].x; targetY = g_net_entities[i].y; targetZ = g_net_entities[i].z; foundTarget = true; }
+                }
+            }
+            else if (targetIdx >= 0 && targetIdx < g_net_entity_count.load()) {
+                if (GetTickCount64() - g_net_entities[targetIdx].last_update < 10000 && !g_net_entities[targetIdx].dead) {
+                    targetX = g_net_entities[targetIdx].x; targetY = g_net_entities[targetIdx].y; targetZ = g_net_entities[targetIdx].z; foundTarget = true;
+                }
+            }
+        }
+        if (foundTarget) {
+            g_orbit_angle += g_orbit_speed.load() * dt;
+            if (g_orbit_angle > 6.28318530) g_orbit_angle -= 6.28318530;
+            tx = targetX + std::cos(g_orbit_angle) * g_orbit_radius.load();
+            tz = targetZ + std::sin(g_orbit_angle) * g_orbit_radius.load();
+            ty = targetY + 1.0f;
+            if (!std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(tz)) { tx = x; ty = y; tz = z; }
+            g_target_x.store(tx); g_target_y.store(ty); g_target_z.store(tz);
+            safe_write_float(base, tx); safe_write_float(base + 4, ty); safe_write_float(base + 8, tz);
+            return;
+        }
+    }
+
+    float quat[4] = { 0, 0, 0, 1 };
+    safe_read_floats(base + 0x0C, quat, 4);
+    float qx = quat[0], qy = quat[1], qz = quat[2], qw = quat[3];
+    bool hasValidQuat = std::isfinite(qx) && std::isfinite(qy) && std::isfinite(qz) && std::isfinite(qw);
+    if (hasValidQuat) { float qmag = qx * qx + qy * qy + qz * qz + qw * qw; if (std::abs(qmag - 1.0f) > 0.1f) hasValidQuat = false; }
+    float forwardX, forwardZ, rightX, rightZ;
+    if (hasValidQuat) {
+        forwardX = 2.0f * (qx * qz + qw * qy); forwardZ = 1.0f - 2.0f * (qx * qx + qy * qy);
+        float fLen = std::sqrt(forwardX * forwardX + forwardZ * forwardZ);
+        if (fLen > 0.001f) { forwardX = -(forwardX / fLen); forwardZ = -(forwardZ / fLen); }
+        else { forwardX = 0; forwardZ = -1; }
+        rightX = 1.0f - 2.0f * (qy * qy + qz * qz); rightZ = 2.0f * (qx * qz - qw * qy);
+        float rLen = std::sqrt(rightX * rightX + rightZ * rightZ);
+        if (rLen > 0.001f) { rightX /= rLen; rightZ /= rLen; }
+        else { rightX = 1; rightZ = 0; }
+    }
+    else { forwardX = 0; forwardZ = -1; rightX = 1; rightZ = 0; }
+    float dx = 0, dz = 0;
+    if (key_down('W')) { dx += forwardX; dz += forwardZ; }
+    if (key_down('S')) { dx -= forwardX; dz -= forwardZ; }
+    if (key_down('D')) { dx += rightX; dz += rightZ; }
+    if (key_down('A')) { dx -= rightX; dz -= rightZ; }
+    float len = std::sqrt(dx * dx + dz * dz);
+    if (len > 0.001f) { dx /= len; dz /= len; }
+    if (fly) {
+        float flySpeed = g_fly_speed.load();
+        tx += dx * flySpeed * dt; tz += dz * flySpeed * dt;
+        if (key_down(VK_SPACE)) ty += flySpeed * dt;
+        if (key_down(VK_SHIFT)) ty -= flySpeed * dt;
+    }
+    else if (noclip) {
+        float noclipSpeed = g_fly_speed.load();
+        tx += dx * noclipSpeed * dt; tz += dz * noclipSpeed * dt;
+        if (key_down(VK_SPACE)) ty += noclipSpeed * dt;
+        if (key_down(VK_SHIFT)) ty -= noclipSpeed * dt;
+    }
+    else if (speed) {
+        float mult = g_speed_mult.load();
+        tx += dx * 5.0f * mult * dt; tz += dz * 5.0f * mult * dt; ty = y;
+    }
+    if (!std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(tz)) { tx = x; ty = y; tz = z; }
+    g_target_x.store(tx); g_target_y.store(ty); g_target_z.store(tz);
+    safe_write_float(base, tx); safe_write_float(base + 4, ty); safe_write_float(base + 8, tz);
+}
+
+DWORD WINAPI MovementSpamThread(LPVOID) {
+    while (g_movement_thread_running.load()) { apply_movement(); Sleep(1); }
+    return 0;
+}
+
+void executor_tick() {}
+
+// =============================================================================
+// DXGI PRESENT
+// =============================================================================
+
+HRESULT __stdcall hooked_present(IDXGISwapChain* swapchain, UINT sync_interval, UINT flags) {
+    HRESULT hr = g_original_present(swapchain, sync_interval, flags);
+    static std::atomic<bool> ticking{ false };
+    bool expected = false;
+    if (ticking.compare_exchange_strong(expected, true)) { executor_tick(); ticking.store(false); }
+    return hr;
+}
+
+bool hook_dxgi_present() {
+    DXGI_SWAP_CHAIN_DESC desc = {};
+    desc.BufferCount = 2; desc.BufferDesc.Width = 1; desc.BufferDesc.Height = 1;
+    desc.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; desc.BufferDesc.RefreshRate = { 60, 1 };
+    desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT; desc.OutputWindow = GetDesktopWindow();
+    desc.SampleDesc.Count = 1; desc.Windowed = TRUE; desc.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+    D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
+    ID3D11Device* device = nullptr; IDXGISwapChain* swapchain = nullptr;
+    HRESULT hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &desc, &swapchain, &device, nullptr, nullptr);
+    if (FAILED(hr) || !swapchain) hr = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, &fl, 1, D3D11_SDK_VERSION, &desc, &swapchain, &device, nullptr, nullptr);
+    if (FAILED(hr) || !swapchain) return false;
+    void** vtable = *reinterpret_cast<void***>(swapchain);
+    g_present_addr = (uintptr_t)vtable[8];
+    memcpy(g_swap_chain_vtable, vtable, sizeof(g_swap_chain_vtable));
+    swapchain->Release(); if (device) device->Release();
+    if (MH_Initialize() != MH_OK && MH_Initialize() != MH_ERROR_ALREADY_INITIALIZED) return false;
+    if (MH_CreateHook((LPVOID)g_present_addr, reinterpret_cast<LPVOID>(&hooked_present), reinterpret_cast<LPVOID*>(&g_original_present)) != MH_OK) return false;
+    if (MH_EnableHook((LPVOID)g_present_addr) != MH_OK) return false;
+    OutputDebugStringA("[Durag] DXGI Present hooked");
+    return true;
+}
+
+// =============================================================================
+// IPC
+// =============================================================================
+
+std::string handle_command(const std::string& cmd) {
+    std::string response;
+    if (cmd.find("\"cmd\":\"ping\"") != std::string::npos) { response = "{\"status\":\"ok\",\"msg\":\"pong\"}"; }
+    else if (cmd.find("\"cmd\":\"world\"") != std::string::npos || cmd.find("\"cmd\":\"player\"") != std::string::npos) {
+        uintptr_t b = g_player_base.load(std::memory_order_relaxed);
+        float x = 0, y = 0, z = 0;
+        if (b) { float pos[3]; if (safe_read_floats(b, pos, 3)) { x = pos[0]; y = pos[1]; z = pos[2]; } }
+        char buf[128]; snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"world\":\"0x%llx\",\"x\":%.2f,\"y\":%.2f,\"z\":%.2f}", b, x, y, z);
+        response = buf;
+    }
+    else if (cmd.find("\"cmd\":\"attach\"") != std::string::npos) { g_player_locked.store(false); g_player_base.store(0); response = "{\"status\":\"ok\",\"msg\":\"re-attaching... move in game\"}"; }
+    else if (cmd.find("\"cmd\":\"list_net_entities\"") != std::string::npos) {
+        std::lock_guard<std::mutex> lk(g_net_mutex);
+        uintptr_t playerBase = g_player_base.load();
+        float px = 0, py = 0, pz = 0;
+        if (playerBase) { float pos[3]; if (safe_read_floats(playerBase, pos, 3)) { px = pos[0]; py = pos[1]; pz = pos[2]; } }
+        uint64_t now = GetTickCount64();
+        std::string json = "{\"status\":\"ok\",\"count\":" + std::to_string(g_net_entity_count.load()) + ",\"entities\":[";
+        bool first = true;
+        for (int i = 0; i < g_net_entity_count.load(); i++) {
+            if (now - g_net_entities[i].last_update > 10000) continue;
+            float dx = g_net_entities[i].x - px, dy = g_net_entities[i].y - py, dz = g_net_entities[i].z - pz;
+            float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (!first) json += ","; first = false;
+            char buf[400];
+            snprintf(buf, sizeof(buf),
+                "{\"idx\":%d,\"id\":%llu,\"name\":\"%s\",\"x\":%.1f,\"y\":%.1f,\"z\":%.1f,\"dist\":%.1f,\"moving\":%s,\"dead\":%s}",
+                i, (unsigned long long)g_net_entities[i].id,
+                g_net_entities[i].name[0] ? g_net_entities[i].name : "",
+                g_net_entities[i].x, g_net_entities[i].y, g_net_entities[i].z, dist,
+                g_net_entities[i].moving ? "true" : "false",
+                g_net_entities[i].dead ? "true" : "false");
+            json += buf;
+        }
+        json += "]}"; response = json;
+    }
+    else if (cmd.find("\"cmd\":\"teleport\"") != std::string::npos) {
+        double tx = 0, ty = 0, tz = 0;
+        if (sscanf_s(cmd.c_str(), "{\"cmd\":\"teleport\",\"x\":%lf,\"y\":%lf,\"z\":%lf}", &tx, &ty, &tz) == 3) {
+            uintptr_t base = g_player_base.load();
+            if (base) { safe_write_float(base, (float)tx); safe_write_float(base + 4, (float)ty); safe_write_float(base + 8, (float)tz); g_target_x.store((float)tx); g_target_y.store((float)ty); g_target_z.store((float)tz); response = "{\"status\":\"ok\",\"msg\":\"teleported\"}"; }
+            else response = "{\"status\":\"error\",\"msg\":\"no player base\"}";
+        }
+        else response = "{\"status\":\"error\",\"msg\":\"invalid coords\"}";
+    }
+    else if (cmd.find("\"cmd\":\"teleport_net\"") != std::string::npos) {
+        int idx = -1; sscanf_s(cmd.c_str(), "{\"cmd\":\"teleport_net\",\"idx\":%d}", &idx);
+        uintptr_t base = g_player_base.load();
+        if (!base) response = "{\"status\":\"error\",\"msg\":\"no player base\"}";
+        else {
+            std::lock_guard<std::mutex> lk(g_net_mutex); uint64_t now = GetTickCount64(); float tx = 0, ty = 0, tz = 0; bool found = false;
+            if (idx == -1) {
+                float px = 0, py = 0, pz = 0; float pos[3]; if (safe_read_floats(base, pos, 3)) { px = pos[0]; py = pos[1]; pz = pos[2]; }
+                float nearestDist = 999999.0f;
+                for (int i = 0; i < g_net_entity_count.load(); i++) {
+                    if (now - g_net_entities[i].last_update > 10000 || g_net_entities[i].dead) continue;
+                    float dx = g_net_entities[i].x - px, dy = g_net_entities[i].y - py, dz = g_net_entities[i].z - pz; float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (dist > 1.0f && dist < nearestDist) { nearestDist = dist; tx = g_net_entities[i].x; ty = g_net_entities[i].y; tz = g_net_entities[i].z; found = true; }
+                }
+            }
+            else if (idx >= 0 && idx < g_net_entity_count.load()) { if (now - g_net_entities[idx].last_update < 10000) { tx = g_net_entities[idx].x; ty = g_net_entities[idx].y; tz = g_net_entities[idx].z; found = true; } }
+            if (found) { safe_write_float(base, tx); safe_write_float(base + 4, ty); safe_write_float(base + 8, tz); g_target_x.store(tx); g_target_y.store(ty); g_target_z.store(tz); response = "{\"status\":\"ok\",\"msg\":\"teleported\"}"; }
+            else response = "{\"status\":\"error\",\"msg\":\"no entities found\"}";
+        }
+    }
+    else if (cmd.find("\"cmd\":\"set_orbit\"") != std::string::npos) { g_orbit_enabled.store(cmd.find("true") != std::string::npos); response = "{\"status\":\"ok\"}"; }
+    else if (cmd.find("\"cmd\":\"set_orbit_speed\"") != std::string::npos) { float val = 2.0f; sscanf_s(cmd.c_str(), "{\"cmd\":\"set_orbit_speed\",\"val\":%f}", &val); g_orbit_speed.store(val); response = "{\"status\":\"ok\"}"; }
+    else if (cmd.find("\"cmd\":\"set_orbit_radius\"") != std::string::npos) { float val = 5.0f; sscanf_s(cmd.c_str(), "{\"cmd\":\"set_orbit_radius\",\"val\":%f}", &val); g_orbit_radius.store(val); response = "{\"status\":\"ok\"}"; }
+    else if (cmd.find("\"cmd\":\"set_orbit_target\"") != std::string::npos) {
+        uint64_t targetId = 0; sscanf_s(cmd.c_str(), "{\"cmd\":\"set_orbit_target\",\"id\":%llu}", &targetId);
+        std::lock_guard<std::mutex> lk(g_net_mutex); int foundIdx = -1;
+        for (int i = 0; i < g_net_entity_count.load(); i++) { if (g_net_entities[i].id == targetId) { foundIdx = i; break; } }
+        if (foundIdx >= 0) { g_orbit_target.store(foundIdx); response = "{\"status\":\"ok\"}"; }
+        else response = "{\"status\":\"error\",\"msg\":\"entity not found\"}";
+    }
+    else if (cmd.find("\"cmd\":\"set_fly\"") != std::string::npos) { g_fly_enabled.store(cmd.find("true") != std::string::npos); response = "{\"status\":\"ok\"}"; }
+    else if (cmd.find("\"cmd\":\"set_noclip\"") != std::string::npos) { g_noclip_enabled.store(cmd.find("true") != std::string::npos); response = "{\"status\":\"ok\"}"; }
+    else if (cmd.find("\"cmd\":\"set_speed\"") != std::string::npos) { g_speed_enabled.store(cmd.find("true") != std::string::npos); response = "{\"status\":\"ok\"}"; }
+    else if (cmd.find("\"cmd\":\"set_fly_speed\"") != std::string::npos) { float val = 50.0f; sscanf_s(cmd.c_str(), "{\"cmd\":\"set_fly_speed\",\"val\":%f}", &val); g_fly_speed.store(val); response = "{\"status\":\"ok\"}"; }
+    else if (cmd.find("\"cmd\":\"set_speed_mult\"") != std::string::npos) { float val = 2.5f; sscanf_s(cmd.c_str(), "{\"cmd\":\"set_speed_mult\",\"val\":%f}", &val); g_speed_mult.store(val); response = "{\"status\":\"ok\"}"; }
+    else if (cmd.find("\"cmd\":\"exec_script\"") != std::string::npos) {
+        if (cmd.find("fly on") != std::string::npos) { g_fly_enabled.store(true); response = "{\"status\":\"ok\",\"msg\":\"fly on\"}"; }
+        else if (cmd.find("fly off") != std::string::npos) { g_fly_enabled.store(false); response = "{\"status\":\"ok\",\"msg\":\"fly off\"}"; }
+        else if (cmd.find("noclip on") != std::string::npos) { g_noclip_enabled.store(true); response = "{\"status\":\"ok\",\"msg\":\"noclip on\"}"; }
+        else if (cmd.find("noclip off") != std::string::npos) { g_noclip_enabled.store(false); response = "{\"status\":\"ok\",\"msg\":\"noclip off\"}"; }
+        else if (cmd.find("speed on") != std::string::npos) { g_speed_enabled.store(true); response = "{\"status\":\"ok\",\"msg\":\"speed on\"}"; }
+        else if (cmd.find("speed off") != std::string::npos) { g_speed_enabled.store(false); response = "{\"status\":\"ok\",\"msg\":\"speed off\"}"; }
+        else if (cmd.find("--stop") != std::string::npos) { g_fly_enabled.store(false); g_noclip_enabled.store(false); g_speed_enabled.store(false); g_orbit_enabled.store(false); response = "{\"status\":\"ok\",\"msg\":\"stopped\"}"; }
+        else response = "{\"status\":\"ok\",\"msg\":\"script queued\"}";
+    }
+    else if (cmd.find("\"cmd\":\"console_cmd\"") != std::string::npos) {
+        if (cmd.find("\"input\":\"ping\"") != std::string::npos) response = "{\"status\":\"ok\",\"msg\":\"pong\"}";
+        else if (cmd.find("\"input\":\"world\"") != std::string::npos) {
+            uintptr_t b = g_player_base.load(); float x = 0, y = 0, z = 0;
+            if (b) { float p[3]; if (safe_read_floats(b, p, 3)) { x = p[0];y = p[1];z = p[2]; } }
+            char buf[128]; snprintf(buf, sizeof(buf), "{\"status\":\"ok\",\"msg\":\"0x%llx (%.1f, %.1f, %.1f)\"}", b, x, y, z); response = buf;
+        }
+        else if (cmd.find("\"input\":\"help\"") != std::string::npos) response = "{\"status\":\"ok\",\"msg\":\"Commands: ping, world, help\"}";
+        else if (cmd.find("orbit_target") != std::string::npos) {
+            uint64_t targetId = 0; sscanf_s(cmd.c_str(), "{\"cmd\":\"console_cmd\",\"input\":\"orbit_target %llu\"}", &targetId);
+            if (targetId > 0) {
+                std::lock_guard<std::mutex> lk(g_net_mutex);
+                for (int i = 0; i < g_net_entity_count.load(); i++) { if (g_net_entities[i].id == targetId) { g_orbit_target.store(i); response = "{\"status\":\"ok\",\"msg\":\"orbit target set\"}"; break; } }
+            }
+            else response = "{\"status\":\"error\",\"msg\":\"invalid id\"}";
+        }
+        else response = "{\"status\":\"ok\",\"msg\":\"unknown\"}";
+    }
+    else response = "{\"status\":\"error\",\"msg\":\"unknown\"}";
+    return response + "\n";
+}
+
+void ipc_server_thread() {
+    const char* pipe_name = "\\\\.\\pipe\\durag_executor";
+    auto buffer = std::make_unique<char[]>(65536);
+    while (g_ipc_running.load() && !g_shutdown.load()) {
+        HANDLE pipe = CreateNamedPipeA(pipe_name, PIPE_ACCESS_DUPLEX, PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT, 1, 65536, 65536, 1000, nullptr);
+        if (pipe == INVALID_HANDLE_VALUE) { Sleep(1000); continue; }
+        if (ConnectNamedPipe(pipe, nullptr) || GetLastError() == ERROR_PIPE_CONNECTED) {
+            DWORD bytes_read = 0;
+            while (g_ipc_running.load() && !g_shutdown.load()) {
+                if (!ReadFile(pipe, buffer.get(), 65535, &bytes_read, nullptr)) break;
+                buffer[bytes_read] = '\0';
+                std::string cmd(buffer.get(), bytes_read);
+                std::string response = handle_command(cmd);
+                DWORD written = 0;
+                WriteFile(pipe, response.c_str(), static_cast<DWORD>(response.size()), &written, nullptr);
+            }
+        }
+        CloseHandle(pipe);
+    }
+}
+
+// =============================================================================
+// DLL ENTRY
+// =============================================================================
+
+void Initialize() {
+    if (g_initialized.load()) return;
+    g_initialized.store(true);
+    OutputDebugStringA("[Durag] Initializing...");
+    if (hook_dxgi_present()) OutputDebugStringA("[Durag] DXGI Present hook installed");
+    InstallWriteHook();
+    if (hook_winsock()) OutputDebugStringA("[Durag] Winsock hook installed");
+    CreateThread(nullptr, 0, MovementSpamThread, nullptr, 0, nullptr);
+    g_ipc_running.store(true);
+    CreateThread(nullptr, 0, [](LPVOID) -> DWORD { ipc_server_thread(); return 0; }, nullptr, 0, nullptr);
+    OutputDebugStringA("[Durag] IPC server started");
+}
+
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD dwReason, LPVOID lpReserved) {
+    switch (dwReason) {
+    case DLL_PROCESS_ATTACH:
+        g_hModule = hModule;
+        DisableThreadLibraryCalls(hModule);
+        CreateThread(nullptr, 0, [](LPVOID) -> DWORD { Sleep(2000); Initialize(); return 0; }, nullptr, 0, nullptr);
+        break;
+    case DLL_PROCESS_DETACH:
+        g_shutdown.store(true);
+        g_ipc_running.store(false);
+        g_movement_thread_running.store(false);
+        if (g_initialized.load()) { MH_DisableHook(MH_ALL_HOOKS); MH_Uninitialize(); }
+        break;
+    }
+    return TRUE;
+}

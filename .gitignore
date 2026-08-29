@@ -1,0 +1,35 @@
+# Visual Studio user files
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.VC.opendb
+
+# Build output
+x64/
+Debug/
+Release/
+obj/
+out/
+build/
+
+# durag_executor build output
+durag_executor/
+
+# Compiled files
+*.dll
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.idb
+*.exp
+
+# Temporary files
+*.log
+*.tmp
+*.bak
+
+# Windows
+Thumbs.db
+desktop.ini
